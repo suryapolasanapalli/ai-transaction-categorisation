@@ -361,24 +361,47 @@ with tab1:
             placeholder="e.g., 5812"
         )
 
+    # Create persistent status placeholder outside button handler
+    agent_status = st.empty()
+    
+    # Initialize session state variables
+    if 'processing' not in st.session_state:
+        st.session_state.processing = False
+    if 'final_status_message' not in st.session_state:
+        st.session_state.final_status_message = None
+
     if st.button("Process Transaction", type="primary"):
-        # Create persistent status placeholder
-        status_container = st.container()
-        with status_container:
-            agent_status = st.empty()
-            
-            result = process_single_transaction(
-                desc, 
-                amt, 
-                merchant_name=merchant if merchant else None,
-                mcc_code=mcc if mcc else None,
-                status_placeholder=agent_status
-            )
-            
-            # Store in session state for feedback
-            st.session_state.classification_result = result
-            st.session_state.feedback_submitted = False
-            st.session_state.updated_result = None
+        # Set processing flag
+        st.session_state.processing = True
+        st.session_state.final_status_message = None
+        
+        result = process_single_transaction(
+            desc, 
+            amt, 
+            merchant_name=merchant if merchant else None,
+            mcc_code=mcc if mcc else None,
+            status_placeholder=agent_status
+        )
+        
+        # Store in session state for feedback
+        st.session_state.classification_result = result
+        st.session_state.feedback_submitted = False
+        st.session_state.updated_result = None
+        st.session_state.processing = False
+        
+        # Store final status message if available
+        if result.get('status') == 'success':
+            flags_display = f" | ⚠️ Flags: {len(result.get('flags', []))}" if result.get('flags') else ""
+            st.session_state.final_status_message = f"✅ **All Steps Complete!** Validation: `{result.get('validation_status', 'N/A')}` | MCC: `{result.get('mcc_code', 'N/A')}` | Final Confidence: `{result.get('confidence', 'N/A').upper()}`{flags_display}"
+        else:
+            st.session_state.final_status_message = f"❌ **Error:** {result.get('error', 'Unknown error')}"
+        
+        # Rerun to display results immediately (status placeholder will persist)
+        st.rerun()
+    
+    # Show final status message if available (after rerun) - this ensures it persists
+    if st.session_state.get('final_status_message') and not st.session_state.get('processing', False):
+        agent_status.success(st.session_state.final_status_message)
     
     # Display results if available in session state
     if 'classification_result' in st.session_state and st.session_state.classification_result:
