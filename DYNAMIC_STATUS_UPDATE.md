@@ -25,26 +25,76 @@ Implemented **real-time dynamic status updates** that show live progress as each
 
 ### **Single Transaction Processing:**
 
-**Step 1: PreprocessingAgent**
+**Step 1: PreprocessingAgent (Deterministic - No LLM)**
 ```
 🔄 Step 1/3: PreprocessingAgent is extracting and cleaning transaction data...
 ↓
 ✅ Step 1/3 Complete: Merchant: STARBUCKS | CMID: a1b2c3d4e5f6... | Tokens: 3
 ```
 
-**Step 2: ClassificationAgent**
+**What Step 1 Does:**
+- **Tokenization**: Breaks down transaction description into individual tokens using spaCy NLP (lemmatization) or regex fallback
+- **Noise Removal**: Removes 5 noise patterns (transaction IDs like #12345, long numeric codes, location codes, asterisks, reference codes)
+- **Text Normalization**: Standardizes text using lemmatization for better linguistic accuracy
+- **Merchant Canonicalization**: Maps merchant variations to canonical names (e.g., "SBX", "SBUX" → "STARBUCKS")
+- **CMID Generation**: Creates Canonical Merchant ID using SHA-256 hash (first 16 characters)
+- **Sensitive Data Encryption**: Encrypts amount and MCC code using SHA-256 for security
+- **Output**: Clean, normalized transaction data with encrypted sensitive information
+
+**Step 2: ClassificationAgent (Agno Agent + Azure OpenAI + RAG)**
 ```
-🔄 Step 2/3: ClassificationAgent is analyzing with AI tools (MCC lookup, vendor search, taxonomy)...
+🔄 Step 2/3: ClassificationAgent is analyzing with AI tools (RAG lookup, custom categories, MCC lookup, vendor search, taxonomy)...
 ↓
 ✅ Step 2/3 Complete: Category: Food & Dining → Coffee Shop | Confidence: HIGH | Tools Used: 2
 ```
 
-**Step 3: GovernanceAgent**
+**What Step 2 Does:**
+The ClassificationAgent uses an Agno Agent with 7 tools, following a priority order:
+
+1. **User Preferred Category (RAG)** - `lookup_user_preference` tool
+   - Searches for similar transactions the user previously corrected
+   - Uses similarity matching (60% threshold): merchant name (70% weight) + description (30% weight)
+   - If match found: Returns user's preferred category/subcategory with HIGH confidence
+
+2. **Custom Categories (GenAI)** - `get_custom_categories` + `match_to_custom_category` tools
+   - Checks if user-defined custom categories exist
+   - Uses GenAI to match transaction to custom categories
+   - If matched: Returns custom category/subcategory with HIGH confidence
+
+3. **MCC Categorization** - `classify_by_mcc_code` tool
+   - If MCC code provided, uses 200+ MCC codes database (ISO 18245 standard)
+   - Returns category/subcategory with HIGH confidence
+
+4. **Vendor Lookup** - `lookup_mcc_by_vendor` tool
+   - Searches 100+ known brands (STARBUCKS, UBER, etc.) for instant MCC lookup
+   - Returns HIGH confidence if vendor recognized
+
+5. **Vendor Database Search** - `vendor_database_search` tool
+   - Searches 20 merchant patterns using fuzzy matching
+   - Returns MEDIUM confidence if pattern matched
+
+6. **Default Taxonomy** - `get_taxonomy_structure` tool
+   - Uses 12 default categories with AI reasoning
+   - Returns MEDIUM/LOW confidence
+
+**Output**: Category, subcategory, confidence level, classification method, reasoning, and tool calls made
+
+**Step 3: GovernanceAgent (Agno Agent + Azure OpenAI)**
 ```
 🔄 Step 3/3: GovernanceAgent is validating classification and assigning MCC code...
 ↓
 ✅ All Steps Complete! Validation: PASS | MCC: 5812 | Final Confidence: HIGH
 ```
+
+**What Step 3 Does:**
+- **Category Validation**: Verifies if the classified category is appropriate for the merchant/transaction type
+- **MCC Code Assignment/Verification**: 
+  - If MCC code missing: Uses `assign_mcc_code_for_category` tool to assign correct MCC code (reverse lookup: Category → MCC)
+  - If MCC code provided: Validates it matches the category
+- **Confidence Assessment**: Evaluates if confidence level is justified, adjusts if needed
+- **Compliance Check**: Flags any concerns (unusual amounts, category mismatches, suspicious patterns)
+- **Audit Trail Generation**: Creates detailed audit notes explaining validation decisions
+- **Output**: Validation status (PASS/FAIL), final MCC code, adjusted confidence, compliance flags, audit notes
 
 ### **Batch CSV Processing:**
 
@@ -112,23 +162,51 @@ for row in df:
 ## 📊 Status Information Displayed
 
 ### **Step 1: Preprocessing** 🔧
-- Merchant name identified
-- CMID (Canonical Merchant ID)
+**Status Message Shows:**
+- Merchant name identified (canonicalized)
+- CMID (Canonical Merchant ID) - first 12 characters
 - Number of tokens extracted
 - Success confirmation
 
+**Behind the Scenes:**
+- Tokenization completed (spaCy NLP or regex)
+- Noise patterns removed (5 patterns)
+- Text normalized and lemmatized
+- Merchant canonicalized to standard name
+- Sensitive data encrypted (amount, MCC)
+
 ### **Step 2: Classification** 🤖
+**Status Message Shows:**
 - Category and subcategory assigned
 - Confidence level (HIGH/MEDIUM/LOW)
 - Number of AI tools used
 - Success confirmation
 
+**Behind the Scenes:**
+- RAG system checked for user preferences (similarity search)
+- Custom categories checked and matched (if exist)
+- MCC code database searched (200+ codes)
+- Vendor database searched (100+ brands)
+- Merchant patterns matched (20 patterns)
+- Default taxonomy used as fallback
+- Classification method tracked (user_preference_rag, custom_categories_genai, mcc_categorization, genai_llm_default)
+- AI reasoning generated
+
 ### **Step 3: Governance** ✅
+**Status Message Shows:**
 - Validation status (PASS/FAIL)
-- MCC code assigned
-- Final confidence level
-- Flags (if any compliance concerns)
+- MCC code assigned/verified
+- Final confidence level (may be adjusted)
+- Flags count (if any compliance concerns)
 - Completion confirmation
+
+**Behind the Scenes:**
+- Category appropriateness validated
+- MCC code assigned via `assign_mcc_code_for_category` tool (if missing)
+- MCC code verified against category (if provided)
+- Confidence level assessed and potentially adjusted
+- Compliance checks performed (unusual amounts, mismatches, suspicious patterns)
+- Detailed audit notes generated
 
 ## 🎨 Visual Design
 

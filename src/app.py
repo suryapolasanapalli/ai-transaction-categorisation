@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import os
 import json
+from typing import Dict, List
 from dotenv import load_dotenv
 from agents.preprocessing_agent import PreprocessingAgent
 from agents.classification_agent import ClassificationAgent
@@ -9,8 +10,13 @@ from agents.governance_agent import GovernanceAgent
 from agents.feedback_agent import FeedbackAgent
 from agno.models.azure import AzureOpenAI
 from tools.vendor_database import vendor_database_search
-from tools.taxonomy import get_taxonomy_structure
-from tools.mcc_codes import classify_by_mcc_code, assign_mcc_code_for_category, lookup_mcc_by_vendor, get_mcc_statistics
+from tools.taxonomy import get_taxonomy_structure, get_valid_categories, get_subcategories, TRANSACTION_CATEGORIES
+from tools.mcc_codes import classify_by_mcc_code, assign_mcc_code_for_category, lookup_mcc_by_vendor, get_mcc_statistics, MCC_CODES
+from tools.user_preferences_tool import lookup_user_preference
+from tools.custom_categories_tool import get_custom_categories, match_to_custom_category
+from tools.store_user_preference_tool import store_user_preference
+from utils.user_preferences import get_preferences_store
+from utils.custom_categories import get_custom_categories_manager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -32,8 +38,10 @@ st.markdown("""
         background: linear-gradient(120deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
+        background-clip: text;
         text-align: center;
         margin-bottom: 0.5rem;
+        display: block;
     }
     
     .subtitle {
@@ -41,6 +49,7 @@ st.markdown("""
         color: #666;
         font-size: 1.2rem;
         margin-bottom: 2rem;
+        display: block;
     }
     
     /* Card styling */
@@ -187,7 +196,15 @@ def get_azure_llm():
 def get_classification_agent():
     """Initialize and cache the classification agent with Agno"""
     llm = get_azure_llm()
-    tools = [classify_by_mcc_code, lookup_mcc_by_vendor, vendor_database_search, get_taxonomy_structure]
+    tools = [
+        lookup_user_preference,      # RAG tool - highest priority
+        get_custom_categories,      # Custom categories check
+        match_to_custom_category,    # Custom category matching
+        classify_by_mcc_code,       # MCC code classification
+        lookup_mcc_by_vendor,       # Vendor lookup
+        vendor_database_search,     # Vendor database search
+        get_taxonomy_structure      # Default taxonomy
+    ]
     return ClassificationAgent(llm=llm, tools=tools)
 
 @st.cache_resource
@@ -201,11 +218,103 @@ def get_governance_agent():
 def get_feedback_agent():
     """Initialize and cache the feedback agent with Agno"""
     llm = get_azure_llm()
-    return FeedbackAgent(llm=llm)
+    tools = [store_user_preference]  # Tool to store user preferences in RAG system
+    return FeedbackAgent(llm=llm, tools=tools)
 
 preprocessing_agent = get_preprocessing_agent()
 classification_agent = get_classification_agent()
 governance_agent = get_governance_agent()
+
+# ---------------------------------------------------------
+# HELPER FUNCTIONS FOR FEEDBACK UI
+# ---------------------------------------------------------
+def get_all_available_categories() -> Dict[str, List[str]]:
+    """
+    Get all available categories from different sources:
+    - Custom categories
+    - User preferences (RAG)
+    - MCC codes
+    - Default taxonomy
+    
+    Returns:
+        Dict with category as key and list of (source, subcategories) as value
+    """
+    all_categories = {}
+    
+    # 1. Custom Categories
+    custom_categories_manager = get_custom_categories_manager()
+    custom_cats = custom_categories_manager.get_categories()
+    for cat, subcats in custom_cats.items():
+        if cat not in all_categories:
+            all_categories[cat] = {"source": "Custom", "subcategories": subcats}
+        else:
+            # Merge subcategories
+            all_categories[cat]["subcategories"].extend(subcats)
+            all_categories[cat]["subcategories"] = list(set(all_categories[cat]["subcategories"]))
+    
+    # 2. User Preferences (RAG)
+    preferences_store = get_preferences_store()
+    preferences = preferences_store.get_all_preferences()
+    for pref in preferences:
+        cat = pref.get("user_category")
+        subcat = pref.get("user_subcategory")
+        if cat:
+            if cat not in all_categories:
+                all_categories[cat] = {"source": "User Preference", "subcategories": []}
+            if subcat and subcat not in all_categories[cat]["subcategories"]:
+                all_categories[cat]["subcategories"].append(subcat)
+    
+    # 3. MCC Codes
+    mcc_categories = {}
+    for code, info in MCC_CODES.items():
+        cat = info.get("category")
+        subcat = info.get("subcategory")
+        if cat:
+            if cat not in mcc_categories:
+                mcc_categories[cat] = []
+            if subcat and subcat not in mcc_categories[cat]:
+                mcc_categories[cat].append(subcat)
+    
+    for cat, subcats in mcc_categories.items():
+        if cat not in all_categories:
+            all_categories[cat] = {"source": "MCC", "subcategories": subcats}
+        else:
+            # Merge subcategories
+            all_categories[cat]["subcategories"].extend(subcats)
+            all_categories[cat]["subcategories"] = list(set(all_categories[cat]["subcategories"]))
+            if all_categories[cat]["source"] != "Custom":
+                all_categories[cat]["source"] = f"{all_categories[cat]['source']}, MCC"
+    
+    # 4. Default Taxonomy
+    default_taxonomy = TRANSACTION_CATEGORIES
+    for cat, subcats in default_taxonomy.items():
+        if cat not in all_categories:
+            all_categories[cat] = {"source": "Default", "subcategories": subcats}
+        else:
+            # Merge subcategories
+            all_categories[cat]["subcategories"].extend(subcats)
+            all_categories[cat]["subcategories"] = list(set(all_categories[cat]["subcategories"]))
+            if "Default" not in all_categories[cat]["source"]:
+                all_categories[cat]["source"] = f"{all_categories[cat]['source']}, Default"
+    
+    return all_categories
+
+
+def get_category_list_for_dropdown() -> List[str]:
+    """Get sorted list of all available categories for dropdown"""
+    all_cats = get_all_available_categories()
+    return sorted(all_cats.keys())
+
+
+def get_subcategories_for_category(category: str) -> List[str]:
+    """Get all available subcategories for a given category"""
+    all_cats = get_all_available_categories()
+    
+    if category in all_cats:
+        return sorted(all_cats[category]["subcategories"])
+    
+    # Fallback to default taxonomy
+    return sorted(get_subcategories(category))
 
 # ---------------------------------------------------------
 # TRANSACTION PROCESSING FUNCTION
@@ -229,7 +338,7 @@ def process_single_transaction(description, amount, merchant_name=None, mcc_code
         
         # Step 2: Classification using Agno Agent
         if status_placeholder:
-            status_placeholder.info("🔄 **Step 2/3:** Classification Agent is analyzing with AI tools (MCC lookup, vendor search, taxonomy)...")
+            status_placeholder.info("🔄 **Step 2/3:** Classification Agent is analyzing with AI tools (RAG,MCC lookup, vendor search, taxonomy)...")
         
         classification_result = classification_agent.execute(
             merchant_name=preprocessed_result.get("merchant_name", "Unknown"),
@@ -244,7 +353,7 @@ def process_single_transaction(description, amount, merchant_name=None, mcc_code
         
         # Step 3: Governance and Validation using Agno Agent
         if status_placeholder:
-            status_placeholder.info("🔄 **Step 3/3:** Governance Agent is validating classification and assigning MCC code...")
+            status_placeholder.info("🔄 **Step 3/3:** Governance Agent is validating classification ...")
         
         governance_result = governance_agent.execute(
             merchant_name=preprocessed_result.get("merchant_name", "Unknown"),
@@ -309,13 +418,13 @@ def process_single_transaction(description, amount, merchant_name=None, mcc_code
 # STREAMLIT UI
 # ---------------------------------------------------------
 st.markdown('<h1 class="main-title">🤖 AI Transaction Classifier</h1>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Powered by Agno Framework + Azure OpenAI | Intelligent Multi-Agent System</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Agno Framework + Azure OpenAI | Intelligent Multi-Agent System</p>', unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("### 🤖 Multi-Agent AI System with Agno Framework")
 st.info("**Preprocessing Agent** → **Classification Agent** → **Governance Agent** → **Feedback Agent**")
 
-tab1, tab2, tab3 = st.tabs(["💳 Single Entry", "📊 Batch CSV Upload", "🏗️ Agent Architecture"])
+tab1, tab2, tab3, tab4 = st.tabs(["💳 Single Entry", "📊 Batch CSV Upload", "⚙️ Settings", "🏗️ Agent Architecture"])
 
 # --- TAB 1: Single Transaction ---
 with tab1:
@@ -388,6 +497,9 @@ with tab1:
         st.session_state.feedback_submitted = False
         st.session_state.updated_result = None
         st.session_state.processing = False
+        # Reset feedback radio button to "Approve Classification"
+        st.session_state.feedback_type_radio = "✅ Approve Classification"
+        st.session_state.quick_feedback = None
         
         # Store final status message if available
         if result.get('status') == 'success':
@@ -680,46 +792,161 @@ with tab1:
                 
                 with col1:
                     st.markdown("#### Choose Feedback Type")
+                    # Initialize feedback_type_radio if not exists or reset to approve
+                    feedback_options = ["✅ Approve Classification", "✏️ Correct Classification", "💬 Add Comment"]
+                    if 'feedback_type_radio' not in st.session_state:
+                        st.session_state.feedback_type_radio = feedback_options[0]
+                    
                     feedback_type = st.radio(
                         "Select one:",
-                        ["✅ Approve Classification", "✏️ Correct Classification", "💬 Add Comment"],
+                        feedback_options,
                         key="feedback_type_radio",
                         help="Choose how you want to provide feedback"
                     )
                 
-                with col2:
-                    st.markdown("#### Quick Actions")
-                    st.markdown("""
-                    <style>
-                    .quick-btn {
-                        display: block;
-                        width: 100%;
-                        margin-bottom: 0.5rem;
-                    }
-                    </style>
-                    """, unsafe_allow_html=True)
-                    if st.button("👍 Looks Good!", use_container_width=True, key="quick_approve"):
-                        st.session_state.quick_feedback = "approve"
-                    if st.button("👎 Needs Fix", use_container_width=True, key="quick_fix"):
-                        st.session_state.quick_feedback = "correct"
+                # with col2:
+                #     st.markdown("#### Quick Actions")
+                #     st.markdown("""
+                #     <style>
+                #     .quick-btn {
+                #         display: block;
+                #         width: 100%;
+                #         margin-bottom: 0.5rem;
+                #     }
+                #     </style>
+                #     """, unsafe_allow_html=True)
+                #     if st.button("👍 Looks Good!", use_container_width=True, key="quick_approve"):
+                #         st.session_state.quick_feedback = "approve"
+                #     if st.button("👎 Needs Fix", use_container_width=True, key="quick_fix"):
+                #         st.session_state.quick_feedback = "correct"
                 
                 # Feedback form
                 if "✏️ Correct Classification" in feedback_type or st.session_state.get('quick_feedback') == 'correct':
                     st.markdown("**Provide Correct Classification:**")
                     
+                    try:
+                        # Get all available categories
+                        all_categories = get_all_available_categories()
+                        category_list = get_category_list_for_dropdown()
+                    except Exception as e:
+                        st.error(f"Error loading categories: {str(e)}")
+                        st.info("Please refresh the page and try again.")
+                        category_list = []
+                        all_categories = {}
+                    
                     col1, col2 = st.columns(2)
+                    
                     with col1:
-                        corrected_category = st.text_input(
-                            "Correct Category:",
-                            value=result.get('category', ''),
-                            key="correct_category"
+                        st.markdown("**Category:**")
+                        # Add "Custom Input" option to the list
+                        category_options = ["--- Select or Enter Custom ---"] + category_list
+                        
+                        # Find current index
+                        current_category = result.get('category', '') or ''
+                        current_idx = 0
+                        if current_category and current_category in category_list:
+                            try:
+                                current_idx = category_list.index(current_category) + 1
+                            except ValueError:
+                                current_idx = 0
+                        
+                        selected_category_idx = st.selectbox(
+                            "Choose from available categories:",
+                            options=range(len(category_options)),
+                            format_func=lambda x: category_options[x],
+                            index=current_idx,
+                            key="category_selectbox"
                         )
+                        
+                        # Determine selected category
+                        corrected_category = ''
+                        try:
+                            if selected_category_idx == 0:
+                                # Custom input selected
+                                corrected_category = st.text_input(
+                                    "Enter Custom Category:",
+                                    value=current_category if current_category and current_category not in category_list else '',
+                                    key="custom_category_input",
+                                    placeholder="e.g., Business Expenses"
+                                ) or ''
+                            else:
+                                # Category from dropdown selected
+                                if selected_category_idx < len(category_options):
+                                    corrected_category = category_options[selected_category_idx] or ''
+                        except Exception as e:
+                            st.error(f"Error in category selection: {str(e)}")
+                            corrected_category = current_category
+                    
                     with col2:
-                        corrected_subcategory = st.text_input(
-                            "Correct Subcategory:",
-                            value=result.get('subcategory', ''),
-                            key="correct_subcategory"
-                        )
+                        st.markdown("**Subcategory:**")
+                        
+                        # Initialize corrected_subcategory
+                        corrected_subcategory = ''
+                        current_subcategory = result.get('subcategory', '') or ''
+                        
+                        # Get subcategories for selected category
+                        if corrected_category and corrected_category.strip() and selected_category_idx > 0:
+                            # Category selected from dropdown
+                            try:
+                                available_subcategories = get_subcategories_for_category(corrected_category)
+                                
+                                if available_subcategories:
+                                    subcategory_options = ["--- Select or Enter Custom ---"] + available_subcategories
+                                    
+                                    # Find current subcategory index
+                                    current_sub_idx = 0
+                                    if current_subcategory in available_subcategories:
+                                        current_sub_idx = available_subcategories.index(current_subcategory) + 1
+                                    
+                                    selected_subcategory_idx = st.selectbox(
+                                        "Choose from available subcategories:",
+                                        options=range(len(subcategory_options)),
+                                        format_func=lambda x: subcategory_options[x],
+                                        index=current_sub_idx,
+                                        key="subcategory_selectbox"
+                                    )
+                                    
+                                    if selected_subcategory_idx == 0:
+                                        # Custom subcategory input
+                                        corrected_subcategory = st.text_input(
+                                            "Enter Custom Subcategory:",
+                                            value=current_subcategory if current_subcategory not in available_subcategories else '',
+                                            key="custom_subcategory_input",
+                                            placeholder="e.g., Office Supplies"
+                                        ) or ''
+                                    else:
+                                        # Subcategory from dropdown
+                                        corrected_subcategory = subcategory_options[selected_subcategory_idx] or ''
+                                else:
+                                    # No subcategories available, use custom input
+                                    corrected_subcategory = st.text_input(
+                                        "Enter Subcategory:",
+                                        value=current_subcategory,
+                                        key="custom_subcategory_input",
+                                        placeholder="e.g., General"
+                                    ) or ''
+                            except Exception as e:
+                                # Fallback to custom input if error
+                                st.warning(f"Error loading subcategories: {str(e)}")
+                                corrected_subcategory = st.text_input(
+                                    "Enter Subcategory:",
+                                    value=current_subcategory,
+                                    key="custom_subcategory_input",
+                                    placeholder="e.g., General"
+                                ) or ''
+                        else:
+                            # Custom category or no category selected, allow custom subcategory
+                            corrected_subcategory = st.text_input(
+                                "Enter Subcategory:",
+                                value=current_subcategory,
+                                key="custom_subcategory_input",
+                                placeholder="e.g., General"
+                            ) or ''
+                    
+                    # Show category source info
+                    if corrected_category and corrected_category in all_categories:
+                        source_info = all_categories[corrected_category]["source"]
+                        st.info(f"ℹ️ Category source: {source_info}")
                     
                     feedback_text = st.text_area(
                         "Additional Comments (Optional):",
@@ -728,24 +955,52 @@ with tab1:
                     )
                     
                     if st.button("🔄 Apply Correction", type="primary", key="apply_correction"):
-                        with st.spinner("Processing your feedback..."):
-                            feedback_agent = get_feedback_agent()
-                            
-                            # Build feedback message
-                            feedback_msg = f"Correct category to: {corrected_category} / {corrected_subcategory}"
-                            if feedback_text:
-                                feedback_msg += f". Additional comments: {feedback_text}"
-                            
-                            # Process feedback
-                            updated_result = feedback_agent.execute(
-                                original_classification=result,
-                                user_feedback=feedback_msg,
-                                feedback_type="correction"
-                            )
-                            
-                            st.session_state.updated_result = updated_result
-                            st.session_state.feedback_submitted = True
-                            st.rerun()
+                        # Validate inputs
+                        corrected_category = corrected_category or ''
+                        corrected_subcategory = corrected_subcategory or ''
+                        
+                        if not corrected_category.strip():
+                            st.error("❌ Please provide a category")
+                        elif not corrected_subcategory.strip():
+                            st.error("❌ Please provide a subcategory")
+                        else:
+                            with st.spinner("Processing your feedback..."):
+                                feedback_agent = get_feedback_agent()
+                                
+                                # Build feedback message
+                                feedback_msg = f"Correct category to: {corrected_category.strip()} / {corrected_subcategory.strip()}"
+                                if feedback_text:
+                                    feedback_msg += f". Additional comments: {feedback_text}"
+                                
+                                # Process feedback
+                                updated_result = feedback_agent.execute(
+                                    original_classification=result,
+                                    user_feedback=feedback_msg,
+                                    feedback_type="correction"
+                                )
+                                
+                                # Store user preference in RAG system for future transactions
+                                # Check if agent already stored it via tool (preference_stored flag)
+                                if updated_result.get('updated', False) and not updated_result.get('preference_stored', False):
+                                    # Agent didn't store it, so we'll store it manually as fallback
+                                    preferences_store = get_preferences_store()
+                                    preferences_store.add_preference(
+                                        merchant_name=result.get('merchant_name', 'Unknown'),
+                                        description=result.get('preprocessing_data', {}).get('normalized_text', '') or result.get('description', ''),
+                                        user_category=updated_result.get('category', corrected_category.strip()),
+                                        user_subcategory=updated_result.get('subcategory', corrected_subcategory.strip()),
+                                        original_category=result.get('category'),
+                                        original_subcategory=result.get('subcategory'),
+                                        amount=result.get('preprocessing_data', {}).get('amount', 0) or result.get('amount', 0)
+                                    )
+                                    updated_result['preference_stored'] = True
+                                elif updated_result.get('preference_stored', False):
+                                    # Agent already stored it via tool
+                                    st.success(f"✅ User preference stored in RAG system (ID: {updated_result.get('preference_id', 'N/A')})")
+                                
+                                st.session_state.updated_result = updated_result
+                                st.session_state.feedback_submitted = True
+                                st.rerun()
                 
                 elif "💬 Add Comment" in feedback_type:
                     feedback_text = st.text_area(
@@ -1038,8 +1293,91 @@ with tab2:
                 content = uploaded_file.read().decode('utf-8', errors='ignore')
                 st.text_area("Raw content:", content[:1000], height=200)
 
-# --- TAB 3: Agent Architecture ---
+# --- TAB 3: Settings (Custom Categories & Preferences) ---
 with tab3:
+    st.markdown("### ⚙️ Settings & Customization")
+    st.markdown("Manage custom categories and view user preferences")
+    st.markdown("---")
+    
+    # Custom Categories Management
+    st.markdown("#### 📁 Custom Categories")
+    st.info("Define your own transaction categories. The AI will use these categories first before default taxonomy.")
+    
+    custom_categories_manager = get_custom_categories_manager()
+    existing_categories = custom_categories_manager.get_categories()
+    
+    if existing_categories:
+        st.markdown("**Current Custom Categories:**")
+        for category, subcategories in existing_categories.items():
+            with st.expander(f"📂 {category}"):
+                st.write("**Subcategories:**")
+                for subcat in subcategories:
+                    st.write(f"- {subcat}")
+                if st.button(f"🗑️ Delete {category}", key=f"delete_{category}"):
+                    custom_categories_manager.remove_category(category)
+                    st.success(f"Deleted category: {category}")
+                    st.rerun()
+    
+    st.markdown("---")
+    st.markdown("#### ➕ Add New Custom Category")
+    
+    with st.form("add_custom_category"):
+        new_category = st.text_input("Category Name", placeholder="e.g., Business Expenses")
+        new_subcategories = st.text_area(
+            "Subcategories (one per line)",
+            placeholder="e.g., Office Supplies\nTravel\nMeals",
+            help="Enter subcategories, one per line"
+        )
+        
+        submitted = st.form_submit_button("➕ Add Category", type="primary")
+        
+        if submitted:
+            if new_category and new_subcategories:
+                subcategories_list = [s.strip() for s in new_subcategories.split('\n') if s.strip()]
+                if subcategories_list:
+                    success = custom_categories_manager.add_category(new_category, subcategories_list)
+                    if success:
+                        st.success(f"✅ Added custom category: {new_category} with {len(subcategories_list)} subcategories")
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to add category")
+                else:
+                    st.warning("⚠️ Please provide at least one subcategory")
+            else:
+                st.warning("⚠️ Please fill in both category name and subcategories")
+    
+    st.markdown("---")
+    
+    # User Preferences View
+    st.markdown("#### 💾 User Preferences (RAG)")
+    st.info("View your transaction classification preferences learned from your feedback.")
+    
+    preferences_store = get_preferences_store()
+    all_preferences = preferences_store.get_all_preferences()
+    
+    if all_preferences:
+        st.markdown(f"**Total Preferences Stored:** {len(all_preferences)}")
+        
+        with st.expander("📋 View All Preferences"):
+            for idx, pref in enumerate(all_preferences):
+                st.markdown(f"""
+                **Preference {idx + 1}:**
+                - Merchant: `{pref.get('merchant_name', 'N/A')}`
+                - User Category: `{pref.get('user_category', 'N/A')}` / `{pref.get('user_subcategory', 'N/A')}`
+                - Original: `{pref.get('original_category', 'N/A')}` / `{pref.get('original_subcategory', 'N/A')}`
+                - Usage Count: {pref.get('usage_count', 0)}
+                - Created: {pref.get('created_at', 'N/A')[:10]}
+                """)
+        
+        if st.button("🗑️ Clear All Preferences", type="secondary"):
+            preferences_store.clear_preferences()
+            st.success("✅ All preferences cleared")
+            st.rerun()
+    else:
+        st.info("No preferences stored yet. Preferences are automatically saved when you correct a classification.")
+
+# --- TAB 4: Agent Architecture ---
+with tab4:
     st.subheader("🤖 Agno Framework - Transaction Classification System")
     
     st.markdown("""
@@ -1054,7 +1392,9 @@ with tab3:
     - **LLM:** Azure OpenAI (gpt-5)
     - **Security:** SHA-256 encryption for sensitive data
     - **UI:** Streamlit with real-time processing
-    - **Architecture:** 4-Agent Sequential Pipeline with Feedback Loop
+    - **Architecture:** 4-Agent Sequential Pipeline with RAG Feedback Loop
+    - **RAG System:** User preference learning with similarity search
+    - **Custom Categories:** User-defined taxonomy support
     
     ---
     
@@ -1067,7 +1407,7 @@ with tab3:
     with col1:
         st.markdown("#### 1️⃣ Preprocessing Agent")
         st.success("""
-        **Type:** Deterministic (No LLM)
+        **Type:** Deterministic (No LLM, No Tools)
         
         **Role:** Data Cleaning & Security
         
@@ -1087,30 +1427,40 @@ with tab3:
         - CMID (Canonical Merchant ID)
         - Encrypted tokens
         - Clean metadata
+        - Normalized text
         """)
     
     with col2:
         st.markdown("#### 2️⃣ Classification Agent")
         st.info("""
-        **Type:** Agno Agent + Azure OpenAI
+        **Type:** Agno Agent + Azure OpenAI + RAG
         
-        **Role:** AI-Powered Classification
+        **Role:** AI-Powered Classification with Learning
         
-        **Agno Tools (4):**
-        1. `classify_by_mcc_code()` - 200+ MCC codes (ISO 18245)
-        2. `lookup_mcc_by_vendor()` - 100+ known brands
-        3. `vendor_database_search()` - 20 merchant patterns
-        4. `get_taxonomy_structure()` - 12 categories
+        **Priority Order:**
+        1. User Preferred Category (RAG)
+        2. Custom Categories (GenAI)
+        3. MCC Categorization
+        4. GenAI LLM (Default)
         
-        **Intelligence:**
-        - Priority: MCC Code → Brand Lookup → Vendor Search → Taxonomy
-        - Enhanced confidence scoring with vendor matching
-        - Multi-source reasoning with 200+ MCC codes
-        - Instant brand recognition (STARBUCKS, UBER, etc.)
+        **Agno Tools (7):**
+        1. `lookup_user_preference()` - RAG user preference lookup
+        2. `get_custom_categories()` - Custom categories check
+        3. `match_to_custom_category()` - Custom category matching
+        4. `classify_by_mcc_code()` - 200+ MCC codes
+        5. `lookup_mcc_by_vendor()` - 100+ brands
+        6. `vendor_database_search()` - 20 patterns
+        7. `get_taxonomy_structure()` - 12 categories
+        
+        **RAG Features:**
+        - User preference learning
+        - Similarity-based retrieval
+        - Custom categories support
         
         **Output:**
         - Category & Subcategory
         - Confidence level
+        - Classification method used
         - Reasoning explanation
         """)
     
@@ -1122,17 +1472,18 @@ with tab3:
         **Role:** Validation & Compliance
         
         **Agno Tools (1):**
-        1. `assign_mcc_code_for_category()` - Reverse lookup
+        1. `assign_mcc_code_for_category()` - Reverse lookup (Category → MCC)
         
         **Intelligence:**
         - Category validation
-        - MCC code verification
+        - MCC code verification/assignment
         - Confidence adjustment
         - Compliance flagging
         
         **Output:**
-        - Validation status
+        - Validation status (PASS/FAIL)
         - Final MCC code
+        - Adjusted confidence
         - Audit notes
         - Compliance flags
         """)
@@ -1143,19 +1494,96 @@ with tab3:
         <div style='padding: 1rem; background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); border-radius: 10px; color: white;'>
         <strong>Type:</strong> Agno Agent + Azure OpenAI<br><br>
         <strong>Role:</strong> User Feedback Processing<br><br>
-        <strong>Agno Tools:</strong> Pure LLM Reasoning<br><br>
+        <strong>Agno Tools (1):</strong><br>
+        1. `store_user_preference()` - Save corrections to RAG<br><br>
+        <strong>UI Features:</strong><br>
+        - Category dropdown (Custom/RAG/MCC/Default)<br>
+        - Dynamic subcategory selection<br>
+        - Custom input options<br>
+        - Auto-saves to RAG system<br><br>
         <strong>Intelligence:</strong><br>
         - Interprets user feedback<br>
         - Updates classifications<br>
         - Maintains consistency<br>
-        - Generates audit trails<br><br>
+        - Generates audit trails<br>
+        - Automatically stores preferences via tool<br><br>
         <strong>Output:</strong><br>
         - Updated classification<br>
         - Adjusted confidence<br>
         - Feedback reasoning<br>
-        - Audit documentation
+        - Audit documentation<br>
+        - RAG preference storage (via tool)
         </div>
         """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # RAG System and Custom Categories
+    st.markdown("### RAG System & Custom Categories")
+    
+    col_rag1, col_rag2 = st.columns(2)
+    
+    with col_rag1:
+        st.markdown("""
+        #### 💾 User Preferences Store (RAG)
+        
+        **Location:** `utils/user_preferences.py`
+        
+        **Features:**
+        - Similarity-based preference retrieval
+        - Automatic learning from user corrections
+        - JSON-based persistent storage
+        - Merchant + description matching
+        
+        **Similarity Algorithm:**
+        - Merchant name matching (70% weight)
+        - Description word overlap (30% weight)
+        - Threshold: 60% similarity
+        
+        **Storage Format:**
+        ```json
+        {
+          "id": "merchant_hash",
+          "merchant_name": "STARBUCKS",
+          "user_category": "Shopping",
+          "user_subcategory": "Retail",
+          "original_category": "Food & Dining",
+          "usage_count": 3,
+          "created_at": "2024-01-01T00:00:00"
+        }
+        ```
+        """)
+    
+    with col_rag2:
+        st.markdown("""
+        #### 📁 Custom Categories Manager
+        
+        **Location:** `utils/custom_categories.py`
+        
+        **Features:**
+        - User-defined categories
+        - Custom subcategories
+        - GenAI matching
+        - JSON-based storage
+        
+        **Usage:**
+        - Define business-specific categories
+        - Override default taxonomy
+        - GenAI matches transactions to custom categories
+        
+        **Storage Format:**
+        ```json
+        {
+          "categories": {
+            "Business Expenses": [
+              "Office Supplies",
+              "Travel",
+              "Meals"
+            ]
+          }
+        }
+        ```
+        """)
     
     st.markdown("---")
     
@@ -1211,52 +1639,155 @@ result = preprocessor.execute(
         st.markdown("""
         #### ClassificationAgent (agents/classification_agent.py)
         
-        **Agno Agent Configuration:**
+        **RAG-Enhanced Classification with Priority Order**
+        
+        The ClassificationAgent implements a four-step priority-based classification system that learns from user feedback and supports custom taxonomies.
+        
+        **Initialization:**
         ```python
-        Agent(
-            name="Transaction Classifier",
-            id="classification-agent",
-            model=AzureOpenAI(id="gpt-5", temperature=1.0),
+        ClassificationAgent(
+            llm=AzureOpenAI(...),
             tools=[
-                classify_by_mcc_code,
-                vendor_database_search,
-                get_taxonomy_structure
+                lookup_user_preference,      # RAG tool
+                get_custom_categories,      # Custom categories
+                match_to_custom_category,    # Custom category matching
+                classify_by_mcc_code,       # MCC classification
+                lookup_mcc_by_vendor,       # Vendor lookup
+                vendor_database_search,     # Vendor database
+                get_taxonomy_structure      # Default taxonomy
             ]
         )
         ```
         
-        **Tool Priority (Instructions to LLM):**
-        1. **HIGH Priority:** MCC code match (if provided) → 95% confidence
-        2. **MEDIUM Priority:** Vendor database lookup → 85% confidence
-        3. **LOW Priority:** Taxonomy reasoning → 70% confidence
+        The agent initializes with:
+        - UserPreferencesStore for RAG-based preference retrieval
+        - CustomCategoriesManager for custom taxonomy support
+        - Agno Agent with 4 tools for fallback classification
         
-        **MCC Code Database (37 codes):**
-        - 5812: Restaurant
-        - 5541: Gas Station
-        - 5411: Grocery Store
-        - 5912: Pharmacy
-        - 7841: Video Streaming
-        - ... 32 more
+        **Execution Flow (execute method):**
         
-        **Vendor Database (20 merchants):**
-        - UBER, STARBUCKS, WALMART, AMAZON, NETFLIX, etc.
+        **Step 1: User Preferred Category (RAG)**
+        - Calls `preferences_store.find_similar_preference(merchant_name, description, similarity_threshold=0.6)`
+        - Similarity algorithm: Merchant name (70% weight) + Description word overlap (30% weight)
+        - If match found (similarity ≥ 60%):
+          - Returns immediately with user's preferred category/subcategory
+          - Confidence: HIGH
+          - Classification method: `user_preference_rag`
+          - Includes similarity score and preference ID in response
         
-        **Taxonomy (12 categories):**
-        - Food & Dining, Transportation, Shopping, Entertainment, etc.
+        **Step 2: Custom Categories (GenAI)**
+        - Checks if custom categories exist via `custom_categories_manager.get_categories()`
+        - If custom categories exist:
+          - Creates a separate Agno Agent for custom category matching
+          - Builds prompt with custom category structure
+          - Agent responds with MATCH: YES/NO_MATCH, CATEGORY, SUBCATEGORY, REASONING
+          - If MATCH=YES and category is valid:
+            - Returns with custom category/subcategory
+            - Confidence: HIGH
+            - Classification method: `custom_categories_genai`
+          - If no match, continues to Step 3
+        
+        **Step 3: MCC Categorization**
+        - If MCC code provided, sets classification_method to `mcc_categorization`
+        - Builds prompt for Agno Agent with MCC code priority
+        - Agent uses `classify_by_mcc_code` tool if MCC provided
+        - Falls back to `lookup_mcc_by_vendor` for known brands
+        - Confidence: HIGH
+        
+        **Step 4: GenAI LLM Categorization (Default)**
+        - If no previous method matched, uses default Agno Agent classification
+        - Classification method: `genai_llm_default`
+        - Agent uses tools in priority order:
+          1. `classify_by_mcc_code` (if MCC provided)
+          2. `lookup_mcc_by_vendor` (for known brands)
+          3. `vendor_database_search` (for merchant patterns)
+          4. `get_taxonomy_structure` (for taxonomy reasoning)
+        - Confidence: MEDIUM/LOW
+        
+        **Response Structure:**
+        ```python
+        {
+            "category": str,
+            "subcategory": str,
+            "confidence": "high/medium/low",
+            "reasoning": str,  # Combined reasoning from all steps
+            "raw_response": str,
+            "tool_calls": list,
+            "agent_used": str,
+            "classification_method": str,  # user_preference_rag, custom_categories_genai, mcc_categorization, genai_llm_default
+            "user_preference_match": {  # Only if RAG match
+                "similarity_score": float,
+                "preference_id": str,
+                "original_category": str,
+                "original_subcategory": str
+            },
+            "metadata": {
+                "merchant_analyzed": str,
+                "amount_analyzed": float,
+                "mcc_provided": bool,
+                "user_preference_checked": bool,
+                "custom_categories_checked": bool
+            }
+        }
+        ```
+        
+        **RAG System Integration:**
+        - **UserPreferencesStore:** JSON-based storage at `user_preferences.json`
+        - **Similarity Algorithm:** 
+          - Merchant name exact match: 1.0
+          - Merchant name partial match: 0.8
+          - Description word overlap: Jaccard similarity
+          - Final score: (merchant_match * 0.7) + (desc_similarity * 0.3)
+        - **Threshold:** 60% similarity required for match
+        - **Auto-learning:** Preferences automatically saved when user corrects classifications
+        
+        **Custom Categories Integration:**
+        - **CustomCategoriesManager:** JSON-based storage at `custom_categories.json`
+        - **GenAI Matching:** Creates dedicated Agno Agent for custom category classification
+        - **Prompt Format:** Includes custom category structure, transaction details, and matching instructions
+        - **Response Parsing:** Extracts MATCH, CATEGORY, SUBCATEGORY, REASONING from agent response
+        
+        **Agno Tools Available:**
+        1. `classify_by_mcc_code(mcc_code)` - 200+ MCC codes (ISO 18245)
+        2. `lookup_mcc_by_vendor(merchant_name)` - 100+ known brands
+        3. `vendor_database_search(query)` - 20 merchant patterns
+        4. `get_taxonomy_structure()` - 12 default categories
+        
+        **Error Handling:**
+        - If RAG search fails: Continues to next step
+        - If custom category matching fails: Logs warning, continues to MCC
+        - If Agno Agent fails: Returns fallback with "Other/General" category, LOW confidence
         """)
         
         st.code("""
-# Example classification execution
-classifier = ClassificationAgent(llm=azure_llm)
+# Actual implementation flow
+classifier = ClassificationAgent(llm=azure_llm, tools=tools)
+
 result = classifier.execute(
-    preprocessed_data=preprocessed_result,
-    mcc_code="5812"
+    merchant_name="STARBUCKS",
+    description="Starbucks Coffee Shop",
+    amount=5.50,
+    mcc_code="5812",
+    metadata={...}
 )
 
-# Agent uses tools autonomously:
-# 1. Calls classify_by_mcc_code("5812")
-# 2. Returns: Food & Dining / Restaurant, HIGH confidence
+# Internal execution:
+# 1. preferences_store.find_similar_preference() → checks RAG
+# 2. custom_categories_manager.get_categories() → checks custom
+# 3. If custom exists: custom_agent.run(prompt) → GenAI match
+# 4. If no match: agent.run(classification_prompt) → Agno tools
+# 5. Returns structured result with classification_method
         """, language="python")
+        
+        st.markdown("""
+        **Key Implementation Details:**
+        
+        - **Reasoning Accumulation:** The agent builds reasoning incrementally through each step, combining all reasoning parts into final response
+        - **Method Tracking:** `classification_method` field indicates which path was taken
+        - **Metadata Tracking:** Response includes flags showing which systems were checked
+        - **Fallback Chain:** Each step gracefully falls back to next if no match found
+        - **Dual Agent System:** Uses separate agent for custom categories vs. default classification
+        """)
     
     with tab_impl3:
         st.markdown("""
@@ -1293,13 +1824,15 @@ result = classifier.execute(
         
         st.code("""
 # Example governance execution
-governance = GovernanceAgent(llm=azure_llm)
+governance = GovernanceAgent(llm=azure_llm, tools=[assign_mcc_code_for_category])
 result = governance.execute(
-    classification_result={
-        'category': 'Food & Dining',
-        'subcategory': 'Restaurant',
-        'confidence': 95
-    }
+    merchant_name="STARBUCKS",
+    description="Coffee Purchase",
+    amount=5.50,
+    category="Food & Dining",
+    subcategory="Restaurant",
+    confidence="high",
+    reasoning="MCC code 5812 matches restaurant category"
 )
 
 # Agent validates and enhances:
@@ -1327,16 +1860,35 @@ result = governance.execute(
         )
         ```
         
+        **UI Features:**
+        1. **Category Selection Dropdown:**
+           - Shows all available categories from:
+             - Custom categories
+             - User preferences (RAG)
+             - MCC codes
+             - Default taxonomy
+           - Option to enter custom category
+        
+        2. **Dynamic Subcategory Selection:**
+           - Updates based on selected category
+           - Shows available subcategories
+           - Option to enter custom subcategory
+        
+        3. **Auto-Save to RAG:**
+           - Automatically stores user corrections
+           - Enables future similar transactions to use user preference
+        
         **Feedback Processing Logic:**
         1. **Analyze Feedback:** Understand user intent and corrections
         2. **Update Classification:** Apply changes to category/subcategory
         3. **Maintain Consistency:** Ensure MCC code aligns with new category
         4. **Adjust Confidence:** Set to HIGH for user corrections
         5. **Generate Audit Trail:** Document all changes for compliance
+        6. **Store in RAG:** Save preference for future similar transactions
         
         **Three Feedback Types:**
         - ✅ **Approval:** User validates classification (no changes)
-        - ✏️ **Correction:** User provides correct category/subcategory
+        - ✏️ **Correction:** User provides correct category/subcategory (saved to RAG)
         - 💬 **Comment:** User shares observations (recorded for learning)
         
         **Intelligence Features:**
@@ -1344,11 +1896,12 @@ result = governance.execute(
         - Maintains data consistency across fields
         - Generates detailed reasoning for changes
         - Creates compliance-ready audit documentation
+        - Automatic RAG learning from corrections
         """)
         
         st.code("""
 # Example feedback execution
-feedback = FeedbackAgent(llm=azure_llm)
+feedback = FeedbackAgent(llm=azure_llm, tools=[store_user_preference])
 
 # User corrects classification
 result = feedback.execute(
@@ -1421,36 +1974,38 @@ result = feedback.execute(
         └─────────────────────────────────────────┘
                               ↓
         ┌─────────────────────────────────────────┐
-        │     STEP 2: ClassificationAgent         │
-        │     Type: Agno Agent + Azure OpenAI     │
-        │     Location: agents/classification_agent.py │
+        │  STEP 2: ClassificationAgent            │
+        │  Type: Agno Agent + Azure OpenAI + RAG  │
+        │  Location: agents/classification_agent.py │
         ├─────────────────────────────────────────┤
         │  Input: Preprocessed data + MCC         │
         │                                         │
-        │  Agno Tools (4):                        │
-        │  1. classify_by_mcc_code()              │
-        │     - 200+ MCC codes (ISO 18245 std)   │
-        │     - HIGH confidence (95%)             │
+        │  PRIORITY ORDER:                        │
+        │  1. User Preference (RAG)               │
+        │     - Similarity search (60% threshold) │
+        │     - UserPreferencesStore              │
+        │     - HIGH confidence                   │
         │                                         │
-        │  2. lookup_mcc_by_vendor()              │
-        │     - 100+ brands (instant lookup)     │
-        │     - HIGH confidence (95%)             │
+        │  2. Custom Categories (GenAI)           │
+        │     - CustomCategoriesManager           │
+        │     - GenAI matching                    │
+        │     - HIGH confidence (if matched)      │
         │                                         │
-        │  3. vendor_database_search()            │
-        │     - 20 patterns (fuzzy matching)     │
-        │     - MEDIUM confidence (85%)           │
+        │  3. MCC Categorization                  │
+        │     - classify_by_mcc_code()            │
+        │     - 200+ MCC codes (ISO 18245)        │
+        │     - HIGH confidence                   │
         │                                         │
-        │  4. get_taxonomy_structure()            │
-        │     - 12 categories (tools/taxonomy.py) │
-        │     - LOW confidence (70%)              │
+        │  4. GenAI LLM (Default)                 │
+        │     - lookup_mcc_by_vendor()            │
+        │     - vendor_database_search()          │
+        │     - get_taxonomy_structure()          │
+        │     - MEDIUM/LOW confidence             │
         │                                         │
-        │  LLM Intelligence:                      │
-        │  • Priority-based tool selection        │
-        │  • Multi-source reasoning               │
-        │  • Confidence scoring                   │
-        │                                         │
-        │  Output: Category + Confidence          │
-        │  • category, subcategory, reasoning     │
+        │  Output: Category + Method + Confidence │
+        │  • category, subcategory, reasoning      │
+        │  • classification_method (tracking)     │
+        │  • user_preference_match (if RAG)       │
         └─────────────────────────────────────────┘
                               ↓
         ┌─────────────────────────────────────────┐
@@ -1488,15 +2043,20 @@ result = feedback.execute(
                     [User Reviews Result]
                               ↓
         ┌─────────────────────────────────────────┐
-        │      STEP 4: FeedbackAgent (Optional)   │
-        │      Type: Agno Agent + Azure OpenAI    │
-        │      Location: agents/feedback_agent.py │
+        │  STEP 4: FeedbackAgent         │
+        │  Type: Agno Agent + Azure OpenAI        │
+        │  Location: agents/feedback_agent.py     │
         ├─────────────────────────────────────────┤
         │  Input: User feedback + Original result │
         │                                         │
+        │  UI Features:                           │
+        │  • Category dropdown (all sources)     │
+        │  • Dynamic subcategory selection        │
+        │  • Custom input options                 │
+        │                                         │
         │  Feedback Types:                        │
         │  • ✅ Approval (validates result)       │
-        │  • ✏️ Correction (updates category)    │
+        │  • ✏️ Correction (updates + saves RAG) │
         │  • 💬 Comment (records observation)    │
         │                                         │
         │  LLM Intelligence:                      │
@@ -1506,17 +2066,24 @@ result = feedback.execute(
         │  • Adjusts confidence (HIGH for user)   │
         │  • Generates detailed audit notes       │
         │                                         │
-        │  Output: Updated result + Audit         │
+        │  RAG Integration:                       │
+        │  • Auto-saves corrections to RAG        │
+        │  • UserPreferencesStore.add_preference()│
+        │  • Enables future preference matching   │
+        │                                         │
+        │  Output: Updated result + Audit + RAG   │
         │  • updated classification (if changed)  │
         │  • feedback reasoning & audit trail     │
         │  • before/after comparison              │
+        │  • preference stored in RAG system       │
         └─────────────────────────────────────────┘
                               ↓
         ┌─────────────────────────────────────────┐
         │      Final Result with User Feedback    │
         │  • User-validated/corrected data        │
         │  • Complete feedback audit trail        │
-        │  • Learning data for model improvement  │
+        │  • Preference saved to RAG system       │
+        │  • Learning data for future transactions│
         └─────────────────────────────────────────┘
     """, language="text")
     
